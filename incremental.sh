@@ -4,6 +4,7 @@ set +m
 # Care and feeding of mapfile
 shopt -s lastpipe || (echo "ERROR: 'lastpipe' shell option not supported by shell. Exiting." 1>&2 ; exit 1)
 
+# FIXME check ALL return values
 # TODO confirm that boolean queries all work correctly!
 # TODO traps!
 # TODO consider adding something to explicitly run for one dataset name i.e. for running initial in parallel
@@ -110,11 +111,10 @@ EOF
             for snapstamp in "${snapstamps[@]}" ; do
                 localstamp=$(date -d $snapstamp +%Y-%m-%dT%H:%M)
                 [[ "$localstamp" =~ 00:00$ ]] || continue
-                echo "$snapstamp"
+                next_backup="$snapstamp"
                 # Clearly we succeeded, so...
                 break
-            done \
-                | read -r next_backup
+            done
             # Check that we found one, otherwise ERROR cannot find or does not exist
             if [[ -z "$next_backup" ]] ; then
                 # FIXME spew error but do not set error state here as this is transient (leave relevant part of this comment)
@@ -178,12 +178,22 @@ EOF
     ################################################################
     if [[ ! -z "${previous_backup}" ]] ; then
         cp -al "${backup_root}/${name}/${previous_backup}" "${backup_root}/${name}/${next_backup}.incomplete"
+        case $? in
+            0)
+                
+                ;;
+            *)
+                echo "ERROR: Unknown error renaming from .incomplete for '${name}' @ '${next_backup}'." 1>&2
+                ;;
+        esac
+        echo "INFO: Finished cp for '${name}' @ '${next_backup}', now updating database..." 1>&2
     fi
 
     #############
     ### rsync ###
     #############
     /usr/bin/rsync "${rsyncopts[@]}" "${remote_host}:${remote_root}/${name}/.zfs/snapshot/${next_backup}/" "${backup_root}/${name}/${next_backup}.incomplete/"
+    
     case $? in
         0) 
             ## A-OK
@@ -205,10 +215,9 @@ EOF
             
             ;;
         *)
-            echo "ERROR: Unknown error running cp for '${name}' @ '${next_backup}'." 1>&2
+            echo "ERROR: Unknown error renaming from .incomplete for '${name}' @ '${next_backup}'." 1>&2
             ;;
     esac
-    echo "INFO: Finished cp for '${name}' @ '${next_backup}', now updating database..." 1>&2
 
     ###############################################################
     ### Release lock (and update other things at the same time) ###
