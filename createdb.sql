@@ -5,7 +5,7 @@ DROP TABLE IF EXISTS backups;
 
 create table host_mappings (
   host             TEXT      UNIQUE  PRIMARY KEY  NOT NULL,
-  connect_as       TEXT      NOT NULL
+  remote_host      TEXT      NOT NULL
 );
 
 create table backups (

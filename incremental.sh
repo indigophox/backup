@@ -5,8 +5,8 @@ set +m
 shopt -s lastpipe || (echo "ERROR: 'lastpipe' shell option not supported by shell. Exiting." 1>&2 ; exit 1)
 
 # FIXME check ALL return values
-# TODO confirm that boolean queries all work correctly!
-# TODO traps!
+# TODO confirm that boolean queries all work correctly!  (they seem to now)
+# TODO check that traps are sufficient
 # TODO consider adding something to explicitly run for one dataset name i.e. for running initial in parallel
 
 #FIXME move this to /etc
@@ -37,23 +37,44 @@ fi
 ###                     ###
 ###########################
 "${sqlite}" "${db}" "SELECT name FROM $table WHERE enable == 'enabled'" | mapfile -t datasets
+if (( $? )) ; then
+    echo "CRITICAL: sqlite operation failed.  Exiting." 1>&2
+    exit 1
+fi
 for name in "${datasets[@]}" ; do
-    ## FIXME should UNSET variables @ end of each loop iteration, or use a subshell
+    ## FIXME should UNSET variables @ end of each loop iteration, or use a function + local
+
+
+    trap "\"${sqlite}\" \"${db}\" \"UPDATE $table SET lock_pid = NULL WHERE name == '$name'\"" INT TERM EXIT
 
     ###############
-    ### Trylock ### (or increment failure count)
+    ### Trylock ###
     ###############
+    # (or increment lock failure count)
     "${sqlite}" "${db}" <<EOF
         BEGIN;
         UPDATE $table SET lock_pid = $$, failed_trylocks = 0 WHERE name == '$name' AND lock_pid IS NULL;
         UPDATE $table SET failed_trylocks = (failed_trylocks + 1) WHERE name == '$name' AND lock_pid IS NOT NULL;
         COMMIT;
 EOF
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Exiting." 1>&2
+        # Shouldn't have gotten lock, so don't mess with it.
+        trap - INT TERM EXIT
+        exit 1
+    fi
     # Check if trylock failed and handle failure
-    if [[ "$("${sqlite}" "${db}" "SELECT lock_pid FROM $table WHERE name == '$name'")" != $$ ]] ; then
-        echo "WARNING: Failed to acquire lock for dataset '$name'" 1>&2
+    lock_pid="$("${sqlite}" "${db}" "SELECT lock_pid FROM $table WHERE name == '$name'")"
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Dataset '${name}' may have been locked.  Exiting." 1>&2
+        exit 1
+    fi
+    if [[ "$lock_pid" != $$ ]] ; then
+        echo "WARNING: Failed to acquire lock for dataset '$name'." 1>&2
+        unset lock_pid
         continue
     fi
+    unset lock_pid
 
     ##########################################################################
     ### Sanity-check all 4 timestamps in DB, else set error state and bail ###
@@ -65,33 +86,64 @@ EOF
     # TODO consider making this more informative as to what problem was detected.
     # TODO desirable to confirm previous/next (if set) are BEFORE NOW, but difficult in SQLite
     # TODO this should also check for correctly-formatted previous/next
-    if (( $("${sqlite}" "${db}" "SELECT ((last_finish IS NOT NULL AND (last_start IS NULL OR previous_backup IS NULL or next_backup IS NULL)) OR (last_start IS NOT NULL AND next_backup IS NULL) OR (previous_backup IS NOT NULL AND next_backup IS NOT NULL AND previous_backup >= next_backup)) FROM $table WHERE name == '$name'") )) ; then
-        "${sqlite}" "${db}" "UPDATE $table SET enable = 'error', last_error = inconsistent database timestamps for this dataset', lock_pid = NULL WHERE name == '$name'"
-        echo "ERROR: inconsistent database timestamps for dataset '$name'" 1>&2
-        break
+    inconsistent="$("${sqlite}" "${db}" "SELECT ((last_finish IS NOT NULL AND (last_start IS NULL OR previous_backup IS NULL or next_backup IS NULL)) OR (last_start IS NOT NULL AND next_backup IS NULL) OR (previous_backup IS NOT NULL AND next_backup IS NOT NULL AND previous_backup >= next_backup)) FROM $table WHERE name == '$name'")"
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Exiting." 1>&2
+        exit 1
     fi
+    if (( inconsistent )) ; then
+        "${sqlite}" "${db}" "UPDATE $table SET enable = 'error', last_error = inconsistent database timestamps for this dataset', lock_pid = NULL WHERE name == '$name'"
+        echo "ERROR: inconsistent database timestamps for dataset '$name'." 1>&2
+        unset inconsistent
+        "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+        trap - INT TERM EXIT
+        continue
+    fi
+    unset inconsistent
 
     ########################################################
     ### Get all relevant database vars before proceeding ###
     ########################################################
-    remote_host="$("${sqlite}" "${db}" "SELECT connect_as FROM ${table} NATURAL JOIN host_mappings WHERE name = '${name}'")"
-    zpool="$("${sqlite}" "${db}" "SELECT zpool FROM ${table} WHERE name = '${name}'")"
-    previous_backup="$("${sqlite}" "${db}" "SELECT previous_backup FROM ${table} WHERE name = '${name}'")"
-    next_backup="$("${sqlite}" "${db}" "SELECT next_backup FROM ${table} WHERE name = '${name}'")"
+    for varname in remote_host zpool previous_backup next_backup ; do
+        value="$("${sqlite}" "${db}" "SELECT $varname FROM ${table} WHERE name = '${name}'")"
+        declare "$varname"="$value"
+        if (( $? )) ; then
+            echo "CRITICAL: sqlite operation failed.  Dataset '${name}' was locked.  Exiting." 1>&2
+            exit 1
+        fi
+    done
 
 
-    ### FIXME need to confirm here that (if next_backup is set) next_backup is at least a little (2h?) old, otherwise don't try to proceed!
+    ### FIXME need to confirm here that (if next_backup is set) next_backup is at least a little (2h?) old, otherwise don't try to proceed!  (obviously use %s to do this)
 
 
-    ########################################################
-    ### Confirm presence of mounted source+dest datasets ### 
-    ########################################################
+    #############################################################################
+    ### Confirm presence of mounted source+dest datasets (not snapshots, yet) ### 
+    #############################################################################
     # Check source (FIXME should also check for status 255)
     # FIXME also check that mountpoint is in fact $remote_root/$name
-    ssh "${remote_host}" "zfs list ${zpool}/${name} &>/dev/null && mountpoint \$(zfs get -H -o value mountpoint ${zpool}/${name})" \
-        || (echo "ERROR: remote source dataset '${zpool}/${name}' does not exist" 1>&2 ; exit 1)
+    ssh "${remote_host}" "zfs list ${zpool}/${name} &>/dev/null && mountpoint \$(zfs get -H -o value mountpoint ${zpool}/${name})"
+    case $? in
+        0)
+            ;;
+        255)
+            echo "CRITICAL: ssh connection to '${remote_host}' failed!  Exiting." 1>&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: remote source dataset '${zpool}/${name}' does not exist." 1>&2
+            "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+            trap - INT TERM EXIT
+            continue
+            ;;
+    esac
     # Check dest FIXME make this exit graceful
-    mountpoint "${backup_root}/${name}" || (echo "ERROR: local path '${backup_root}/${name}' does not exist" 1>&2 ; exit 1)
+    if ! mountpoint "${backup_root}/${name}" &>/dev/null ; then
+        echo "ERROR: local path '${backup_root}/${name}' is not a mountpoint." 1>&2
+        "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+        trap - INT TERM EXIT
+        continue
+    fi
 
 
     ## If next is not set, figure it out.
@@ -100,14 +152,27 @@ EOF
         if [[ -z "${previous_backup}" ]] ; then
             ## Infer oldest available from source snapshots
             # REQUIRES shopt 'lastpipe'
-            ssh "${remote_host}" "zfs list -H -o name -t snapshot -d 1 ${zpool}/${name}" \
-                | sed -r "s:^${zpool}/${name}@::" \
-                | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}UTC$' \
-                | sort \
-                | mapfile -t snapstamps
-            # Check PIPESTATUS[0] here to see how `ssh` fared
-            # FIXME check exit status ^^
-            # Select the first midnight one
+            ssh "${remote_host}" "zfs list -H -o name -t snapshot -d 1 ${zpool}/${name}" 2>/dev/null \
+                | sed -r "s:^${zpool}/${name}@::" 2>/dev/null \
+                | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}UTC$' 2>/dev/null  \
+                | sort 2>/dev/null \
+                | mapfile -t snapstamps 2>/dev/null
+            # TODO could also check other pipestatus values, but they should not have the same 
+            case "${PIPESTATUS[0]}" in
+                0)
+                    ;;
+                255)
+                    echo "CRITICAL: ssh connection to '${remote_host}' failed!  Exiting." 1>&2
+                    exit 1
+                    ;;
+                *)
+                    echo "ERROR: Could not get remote snapshot list for '${zpool}/${name}'."
+                    "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+                    trap - INT TERM EXIT
+                    continue
+                    ;;
+            esac
+            ## Select the first midnight one
             for snapstamp in "${snapstamps[@]}" ; do
                 localstamp=$(date -d $snapstamp +%Y-%m-%dT%H:%M)
                 [[ "$localstamp" =~ 00:00$ ]] || continue
@@ -115,10 +180,12 @@ EOF
                 # Clearly we succeeded, so...
                 break
             done
-            # Check that we found one, otherwise ERROR cannot find or does not exist
+            ## Check that we found one, otherwise ERROR cannot find or does not exist
             if [[ -z "$next_backup" ]] ; then
                 # FIXME spew error but do not set error state here as this is transient (leave relevant part of this comment)
                 # Bail from this dataset
+                "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+                trap - INT TERM EXIT
                 continue
             fi
             # TODO consider checking that timestamp VALUE actually makes sense (i.e. is before now)
@@ -139,9 +206,13 @@ EOF
     # is incomplete vs when `rsync` is incomplete as rsync can be resumed.
     #
     aborted="$("${sqlite}" "${db}" "SELECT (last_start IS NOT NULL AND (last_finish IS NULL OR (last_start > last_finish))) FROM $table WHERE name == '$name'")"
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Dataset '${name}' was locked.  Exiting." 1>&2
+        exit 1
+    fi
     if (( aborted )) ; then
         # See if it actually completed but wasn't marked as complete;
-        # if so, update and continue to do next backup.
+        # if so, update and continue to do next_backup.
         if [[ -d "${backup_root}/${name}/${next_backup}" ]] ; then
             # Correct database and change local vars accordingly
             previous_backup="${next_backup}"
@@ -154,6 +225,10 @@ EOF
                 UPDATE ${table} SET first_backup = '${previous_backup}' WHERE name = '${name}' AND first_backup IS NULL;
                 COMMIT;
 EOF
+            if (( $? )) ; then
+                echo "CRITICAL: sqlite operation failed.  Dataset '${name}' was locked.  Exiting." 1>&2
+                exit 1
+            fi
         elif [[ -d "${backup_root}/${name}/${next_backup}.incomplete" ]] ; then
             rm -Rf "${backup_root}/${name}/${next_backup}.incomplete"
         fi
@@ -162,16 +237,32 @@ EOF
     ### (FIXME) Confirm that source snapshot exists and is mounted, and that dest and dest.incomplete do not exist ###
     # set ERROR state if dest exits, otherwise just(?) log ERROR if source does not exist
     # FIXME code here
-
-
     ## FIXME THIS IS NOT THE COMPLETE, ROBUST THING TO BE DOING HERE TO ENSURE THAT THE REMOTE SNAPSHOT IS MOUNTED.  THIS IS JUST HERE SO I CAN TEST THE REST.  NEED TO INVESTIGATE FURTHER WHAT THE "IDEAL" APPROACH TO THIS IS.
-    ssh "${remote_host}" "ls \"${remote_root}/${name}/.zfs/snapshot/${next_backup}\"" &>/dev/null
+    ssh "${remote_host}" "zfs list -t snapshots ${zpool}/${name}@${next_backup} && ls \"${remote_root}/${name}/.zfs/snapshot/${next_backup}\"" &>/dev/null
+    case $? in
+        0)
+            ;;
+        255)
+            echo "CRITICAL: ssh connection to '${remote_host}' failed!  Exiting." 1>&2
+            exit 1
+            ;;
+        *)
+            echo "ERROR: Backup source snapshot '${zpool}/${name}@${next_backup}' does not exist or is not mounted." 1>&2
+            "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+            trap - INT TERM EXIT
+            continue
+            ;;
+    esac
 
     ##################################
     ### Let DB know we're starting ###
     ##################################
     echo "INFO: Setting next_backup in database and commencing backup @ '${next_backup}' for '${name}'" 1>&2
     "${sqlite}" "${db}" "UPDATE ${table} SET next_backup = '${next_backup}', last_start = '$(date +%s)' WHERE name = '${name}'"
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Dataset '${name}' was locked.  Exiting." 1>&2
+        exit 1
+    fi
 
     ################################################################
     ### Set up (dupe) hardlinks if there is a 'previous_backup' ####
@@ -208,6 +299,8 @@ EOF
         ## TODO handle some known-cases explicitly here like syntax errors (which should not happen but might as well add them) etc.
         *)
             echo "ERROR: Unknown error running rsync for '${name}' version '${next_backup}'." 1>&2
+            "${sqlite}" "${db}" "UPDATE $table SET lock_pid = NULL WHERE name = '${name}'"
+            trap - INT TERM EXIT
             continue
             ;;
     esac
@@ -241,6 +334,11 @@ EOF
         UPDATE ${table} SET first_backup = '${previous_backup}' WHERE name = '${name}' AND first_backup IS NULL;
         COMMIT;
 EOF
+    if (( $? )) ; then
+        echo "CRITICAL: sqlite operation failed.  Dataset '${name}' was locked.  Exiting." 1>&2
+        exit 1
+    fi
+    trap - INT TERM EXIT
 
     ####################
     ### Housekeeping ###
