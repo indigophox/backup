@@ -37,7 +37,7 @@ fi
 ###                     ###
 ###########################
 "${sqlite}" "${db}" "SELECT name FROM $table WHERE enable == 'enabled'" | mapfile -t datasets
-for name in "${DATASETS[@]}" ; do
+for name in "${datasets[@]}" ; do
     ## FIXME should UNSET variables @ end of each loop iteration, or use a subshell
 
     ###############
