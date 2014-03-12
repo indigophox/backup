@@ -189,6 +189,13 @@ EOF
         echo "INFO: Finished cp for '${name}' @ '${next_backup}', now updating database..." 1>&2
     fi
 
+
+    ####################################################################################
+    ### Leverage 'R' deltas from `zfs diff` here once diff actually works correctly. ###
+    ####################################################################################
+
+
+
     #############
     ### rsync ###
     #############
