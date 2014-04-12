@@ -2,7 +2,10 @@
 # No point in setting in shebang as bash typically overrides this ; redundant for script but critical for testing in interactive shell
 set +m
 # Care and feeding of mapfile
-shopt -s lastpipe || (echo "ERROR: 'lastpipe' shell option not supported by shell. Exiting." 1>&2 ; exit 1)
+if ! shopt -s lastpipe ; then
+    echo "ERROR: 'lastpipe' shell option not supported by shell. Exiting." 1>&2
+    exit 1
+fi
 
 # FIXME check ALL return values
 # TODO confirm that boolean queries all work correctly!  (they seem to now)
